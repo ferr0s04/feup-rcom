@@ -5,7 +5,7 @@ Computer Networks (RCOM)
 
 **Contents**  
 Solved weekly homework exercises  
-Projects (SOON)
+Project 1 (Data Link Protocol)
 
 ## Projects
 SOON
