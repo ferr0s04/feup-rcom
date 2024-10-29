@@ -1,100 +1,153 @@
-
-// Application layer protocol implementation
-
 #include "application_layer.h"
 #include "link_layer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-int handleReceiver(const char *filename);
-int handleTransmitter(const char *filename);
+#define BUFFER_SIZE 256
+
+FILE *inputFile;
+FILE *outputFile;
+char buffer[BUFFER_SIZE];
+int handleReceiver();
+int handleTransmitter();
 
 void applicationLayer(const char *serialPort, const char *role, int baudRate,
                       int nTries, int timeout, const char *filename)
 {
-    // Set up link layer parameters
-    LinkLayer connectionParameters;
-    strcpy(connectionParameters.serialPort, serialPort);
-    connectionParameters.baudRate = baudRate;
-    connectionParameters.role = (strcmp(role, "tx") == 0) ? LlTx : LlRx;
-    connectionParameters.nRetransmissions = nTries;
-    connectionParameters.timeout = timeout;
+    LinkLayer linkLayer;
 
-    // Open connection
-    if (llopen(connectionParameters) < 0) {
-        printf("Failed to establish connection.\n");
-        return;
-    }
+    strcpy(linkLayer.serialPort, serialPort);
 
-    if (connectionParameters.role == LlRx) // Receiver
-    {
-        if (handleReceiver(filename) < 0)
-        {
-            printf("Error during data transfer.\n");
+    if (strcmp(role, "tx") == 0) {
+        linkLayer.role = LlTx;
+        inputFile = fopen(filename, "rb"); // Open file for reading in binary mode
+        if (inputFile == NULL) {
+            perror("Failed to open input file");
+            exit(-1);
         }
     }
-    else if (connectionParameters.role == LlTx) // Transmitter
-    {
-        if (handleTransmitter(filename) < 0)
-        {
-            printf("Error during data transfer.\n");
+    else if (strcmp(role, "rx") == 0) {
+        linkLayer.role = LlRx;
+        outputFile = fopen(filename, "wb"); // Open file for writing in binary mode
+        if (outputFile == NULL) {
+            perror("Failed to create output file");
+            exit(-1);
         }
     }
-
-    // Close connection
-    if (llclose(1) < 0) {
-        printf("Failed to close connection.\n");
+    else {
+        perror("Invalid role\n");
+        exit(-1);
     }
+
+    linkLayer.baudRate = baudRate;
+    linkLayer.nRetransmissions = nTries;
+    linkLayer.timeout = timeout;    
+
+    int fd = llopen(linkLayer);
+
+    if (fd < 0) {
+        perror("Failed to open connection\n");
+        exit(-1);
+    }
+
+    printf("Serial Port connection successful\n");
+
+    if (linkLayer.role == LlTx) {
+        if (handleTransmitter() < 0) return;
+    }
+    else if (linkLayer.role == LlRx) {
+        if (handleReceiver() < 0) return;
+    }
+
+    if (llclose(fd) == -1) {
+        perror("Failed to close connection\n");
+        exit(-1);
+    }
+
+    printf("Connection closed\n");
 }
 
-int handleReceiver(const char *filename) {
-    unsigned char packet[MAX_PAYLOAD_SIZE];
-    int bytesRead = llread(packet);
-
-    if (bytesRead < 0) {
-        printf("Failed to receive the file.\n");
-    } else {
-        FILE *file = fopen(filename, "wb");
-        if (!file) {
-            perror("Failed to open file for writing");
-            return -1;
-        }
-        fwrite(packet, 1, bytesRead, file);
-        fclose(file);
-        printf("File received successfully: %d bytes written to %s.\n", bytesRead, filename);
+int handleReceiver() {
+    if (outputFile == NULL) {
+        perror("Error creating output file");
+        exit(-1);
     }
+
+    int bytesReceived;
+    int totalBytesReceived = 0;
+
+    printf("Receiving data...\n");
+
+    // Read data from link layer and write to file
+    while ((bytesReceived = llread((unsigned char *)buffer)) > 0) {
+        if (bytesReceived > 3) {
+            int bytesToWrite = bytesReceived - 3; // Adjust the number of bytes to write
+            int bytesWritten = fwrite(buffer + 3, 1, bytesToWrite, outputFile);
+            if (bytesWritten != bytesToWrite) {
+                perror("Error writing to file");
+                break;
+            }
+
+            totalBytesReceived += bytesWritten;
+            printf("Received %d bytes, Total received: %d bytes\n", bytesWritten, totalBytesReceived);
+        } else {
+            printf("Received %d bytes\n", bytesReceived);
+        }
+
+    }
+
+    if (bytesReceived < 0) {
+        perror("Error receiving packet");
+        exit(-1);
+    } else {
+        printf("File received successfully. Total bytes received: %d\n", totalBytesReceived);
+    }
+
+    fclose(outputFile);
     return 1;
 }
 
-int handleTransmitter(const char *filename) {
-    FILE *file = fopen(filename, "rb");
-    if (!file) {
-        perror("Failed to open file for reading");
-        return -1;
+int handleTransmitter() {
+    if (inputFile == NULL) {
+        perror("File not found\n");
+        exit(-1);
     }
 
-    fseek(file, 0, SEEK_END);
-    long fileSize = ftell(file);
-    fseek(file, 0, SEEK_SET);
+    size_t bytesRead;
+    int totalBytesSent = 0;
 
-    unsigned char *buffer = (unsigned char *)malloc(fileSize);
-    if (!buffer) {
-        perror("Failed to allocate memory");
-        fclose(file);
-        return -1;
+    printf("Starting transmission...\n");
+
+    while (1) {
+        // Read data from input file
+        bytesRead = fread(buffer, 1, BUFFER_SIZE, inputFile);
+        if (bytesRead == 0) {
+            if (feof(inputFile)) break;  // EOF reached
+            if (ferror(inputFile)) {
+                perror("Error reading input file");
+                break;
+            }
+        }
+
+        // Transmit data via llwrite, ensuring all bytes are sent
+        int totalSent = 0;
+        while (totalSent < bytesRead) {
+            int res = llwrite((unsigned char *)buffer + totalSent, bytesRead - totalSent);
+            if (res < 0) {
+                perror("Error transmitting packet\n");
+                fclose(inputFile);
+                return -1;
+            }
+            totalSent += res;
+        }
+
+        totalBytesSent += totalSent;
+        printf("Sent %d bytes, Total sent: %d bytes\n", totalSent, totalBytesSent);
     }
 
-    fread(buffer, 1, fileSize, file);
-    fclose(file);
-
-    int bytesWritten = llwrite(buffer, fileSize);
-    if (bytesWritten < 0) {
-        printf("Failed to send the file.\n");
-    } else {
-        printf("File sent successfully: %d bytes written.\n", bytesWritten);
-    }
-
-    free(buffer);
+    fclose(inputFile);
+    printf("Transmission complete. Total bytes sent: %d\n", totalBytesSent);
     return 1;
 }
+

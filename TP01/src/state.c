@@ -1,59 +1,44 @@
 #include "state.h"
 #include "macros.h"
 
-// Function to process state machine
-State processState(State currentState, unsigned char byte, unsigned char *address, unsigned char *control, unsigned char *bcc) {
-    switch (currentState) {
+int updateStateTransmitter(State *currentState, unsigned char byte) {
+    switch (*currentState) {
         case START:
-            if (byte == FLAG) {
-                return FLAG_RCV;  // Transition to FLAG_RCV if FLAG is received
-            }
+            if (byte == FLAG)
+                *currentState = FLAG_RCV;
             break;
-
         case FLAG_RCV:
-            if (byte == A_TX || byte == A_RX) {  // Expected address
-                *address = byte;
-                return A_RCV;  // Transition to A_RCV
-            } else if (byte == FLAG) {
-                return FLAG_RCV;  // Stay in FLAG_RCV if another FLAG is received
-            } else {
-                return START;  // Restart on Other_RCV
-            }
+            if (byte == A_RX)
+                *currentState = A_RCV;
+            else if (byte != FLAG)
+                *currentState = START;
             break;
-
         case A_RCV:
-            if (byte == FLAG) {
-                return FLAG_RCV;  // Return to FLAG_RCV if FLAG is received
-            }
-            *control = byte;
-            return C_RCV;  // Transition to C_RCV
+            if (byte == UA)
+                *currentState = C_RCV;
+            else if (byte == FLAG)
+                *currentState = FLAG_RCV;
+            else
+                *currentState = START;
             break;
-
         case C_RCV:
-            if (byte == FLAG) {
-                return FLAG_RCV;  // Return to FLAG_RCV if FLAG is received
-            }
-            *bcc = *address ^ *control;  // Calculate BCC1
-            if (byte == *bcc) {
-                return BCC_OK;  // If BCC is correct, transition to BCC_OK
-            } else {
-                return START;  // Restart if BCC is incorrect
-            }
+            if (byte == (A_RX ^ UA))
+                *currentState = BCC_OK;
+            else if (byte == FLAG)
+                *currentState = FLAG_RCV;
+            else
+                *currentState = START;
             break;
-
         case BCC_OK:
-            if (byte == FLAG) {
-                return STOP;  // Transition to STOP on receiving FLAG
-            } else {
-                return START;  // Restart if not FLAG
-            }
+            if (byte == FLAG)
+                *currentState = STOP;
+            else
+                *currentState = START;
             break;
-
         default:
-            return START;  // Unknown state, restart the state machine
+            break;
     }
-
-    return currentState;  // Return current state if no transition occurred
+    return *currentState;
 }
 
 // Function to check if the state is final

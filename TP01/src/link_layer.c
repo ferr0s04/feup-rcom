@@ -2,450 +2,270 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include "link_layer.h"
 #include "serial_port.h"
 #include "macros.h"
 #include "state.h"
-#include "alarm.h"
 
 // MISC
 #define _POSIX_SOURCE 1 // POSIX compliant source
 
-static int ns = 0;
 int frameNumber = 0;
 int framesReceived = 0;
 unsigned char lastAddress = 0;
 unsigned char lastControl = 0;
+State state = START;
+int alarmEnabled = FALSE;
+int alarmCount = 0;
+unsigned char byte;
+unsigned char buf_tx = 0;
 
 LinkLayer linkLayer;
-int llopen_receiver();
-int llopen_transmitter();
-int llclose_receiver();
-int llclose_transmitter();
-int sendDataFrame(const unsigned char *data, int dataSize);
-int sendSET();
-int sendACK();
-int sendRR();
-int sendREJ();
-int writeBytes(const unsigned char *bytes, int num_bytes);
-int isDuplicate(unsigned char address, unsigned char control);
-int isValidData(unsigned char bcc, const unsigned char *data, int length);
+void alarmHandler(int signal);
+int llopenReceiver();
+int llopenTransmitter(LinkLayer connectionParameters);
+
+void alarmHandler(int signal)
+{
+    alarmEnabled = FALSE;
+    alarmCount++;
+
+    printf("Alarm #%d\n", alarmCount);
+    printf("Enabled = %d\n", alarmEnabled);
+}
 
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
-int llopen(LinkLayer connectionParameters) {
-    int fd = openSerialPort(connectionParameters.serialPort, connectionParameters.baudRate);
-
-    if (fd < 0) {
-        perror("Error opening serial port");
-        return -1;
+int llopen(LinkLayer connectionParameters)
+{
+    if (openSerialPort(connectionParameters.serialPort, connectionParameters.baudRate) < 0) {
+        perror("Failed to open serial port\n");
+        exit(-1);
     }
 
-    linkLayer = connectionParameters;
-    
-    if (connectionParameters.role == LlTx) {
-        if (llopen_transmitter() < 0) return -1;
+    switch (connectionParameters.role) {
+        case LlTx:
+            return llopenTransmitter(connectionParameters);
+        case LlRx:
+            return llopenReceiver();
+        default:
+            perror("Invalid role\n");
+            return -1;
     }
-    else if (connectionParameters.role == LlRx) {
-        if (llopen_receiver() < 0) return -1;
-    }
-    else if (connectionParameters.role != LlRx && connectionParameters.role != LlTx) return -1;
-
-    return 1;
 }
 
 ////////////////////////////////////////////////
 // LLWRITE
 ////////////////////////////////////////////////
 int llwrite(const unsigned char *buf, int bufSize) {
-    extern int alarmEnabled;
-    extern int alarmCount;
-    alarmEnabled = FALSE;
-    alarmCount = 0;
-    unsigned int attempts = 0;
+    // Frame with start/end flags, address, control fields, and BCC
+    int maxFrameSize = 6 + 2 * bufSize;  // Worst case (stuffing doubles size)
+    unsigned char *frame = (unsigned char *)malloc(maxFrameSize);
 
-    (void)signal(SIGALRM, alarmHandler);
+    frame[0] = FLAG;  // Start flag
+    frame[1] = A_TX;  // Address (example address)
+    frame[2] = C_N(buf_tx);  // Control field (example control)
+    frame[3] = frame[1] ^ frame[2];  // BCC1
 
-    while (attempts < linkLayer.nRetransmissions) {
-        attempts++;
+    // Calculate BCC2 over the data payload
+    unsigned char BCC2 = buf[0];
+    for (int i = 1; i < bufSize; i++) {
+        BCC2 ^= buf[i];
+    }
 
-        if (sendDataFrame(buf, bufSize) < 0) {
-            alarm(0);
-            continue;
-        }
-
-        alarm(linkLayer.timeout);
-        alarmEnabled = TRUE;
-        State state = START;
-
-        while (alarmEnabled) {
-            unsigned char byte = 0;
-            if (readByteSerialPort(&byte) == 0) {
-                continue;
-            }
-            else if (readByteSerialPort(&byte) < 0) {
-                printf("Read error\n");
-                return -1;
-            }
-            state = processState(state, byte, NULL, NULL, NULL);
-
-            if (state == RR) {
-                printf("Received RR for frame with NS = %d\n", ns);
-                ns = (ns + 1) % 2;
-                alarm(0);
-                return bufSize;
-            } else if (state == REJ) {
-                printf("Received REJ for frame with NS = %d\n", ns);
-                attempts--;
-                alarm(0);
-                break;
-            }
+    // Copy data and apply byte stuffing
+    int stuffedIndex = 4;
+    for (int i = 0; i < bufSize; i++) {
+        if (buf[i] == FLAG || buf[i] == ESC) {
+            frame[stuffedIndex++] = ESC;
+            frame[stuffedIndex++] = buf[i] ^ 0x20;  // XOR with 0x20 after ESC
+        } else {
+            frame[stuffedIndex++] = buf[i];
         }
     }
 
-    if (alarmCount >= linkLayer.nRetransmissions) {
-        printf("Maximum retries reached. Write failed.\n");
+    // Add BCC2 with stuffing
+    if (BCC2 == FLAG || BCC2 == ESC) {
+        frame[stuffedIndex++] = ESC;
+        frame[stuffedIndex++] = BCC2 ^ 0x20;
+    } else {
+        frame[stuffedIndex++] = BCC2;
     }
-    return -1;
+
+    frame[stuffedIndex++] = FLAG;  // End flag
+
+    // Write the frame to the serial port
+    if (writeBytesSerialPort(frame, stuffedIndex) < 0) {
+        perror("Failed to write frame");
+        free(frame);
+        return -1;
+    }
+
+    free(frame);
+    return bufSize;
 }
 
 ////////////////////////////////////////////////
 // LLREAD
 ////////////////////////////////////////////////
 int llread(unsigned char *packet) {
-    unsigned char byte, address, control, bcc;
-    State state = START;
-    int bytesRead = 0;
-    int received = 0;
+    unsigned char byte;
+    unsigned char destuffedPacket[1024];
+    int destuffedIndex = 0;
+    int inEscapeMode = 0;
+    int isPacketStarted = 0; // To track if we have started receiving a valid packet
 
-    while (!isStateFinal(state)) {
-        if (readByteSerialPort(&byte) == 0) {
-            continue;
-        }
-        else if (readByteSerialPort(&byte) < 0) {
-            printf("Read error\n");
-            return -1;
+    while (1) {
+        if (readByteSerialPort(&byte) < 0) {
+            perror("Failed to read byte from serial port");
+            exit(-1);
         }
 
-        processState(state, byte, &address, &control, &bcc);
+        // Check for the start flag
+        if (byte == FLAG) {
+            // If we have previously started receiving a packet, it means we have a complete packet
+            if (isPacketStarted) {
+                // Validate and process the complete frame
+                if (destuffedIndex > 0) {
+                    // Validate BCC2
+                    unsigned char bcc2 = destuffedPacket[destuffedIndex - 1]; // Last byte is BCC2
+                    destuffedIndex--;  // Remove BCC2 from the packet
 
-        if (state == STOP) {
-            if (control == SET) {
-                if (sendRR(address) < 0) {
-                    return -1;
+                    // Calculate BCC2 over the destuffed data
+                    unsigned char acc = destuffedPacket[0];
+                    for (int j = 1; j < destuffedIndex; j++) {
+                        acc ^= destuffedPacket[j];
+                    }
+
+                    // Validate BCC2
+                    if (bcc2 == acc) {
+                        memcpy(packet, destuffedPacket, destuffedIndex);
+                        return destuffedIndex;  // Return size of the valid data
+                    }
                 }
-            } else if (isDuplicate(address, control)) {
-                if (sendRR(address) < 0) {
-                    return -1;
-                }
-            } else if (!isValidData(bcc, packet, bytesRead)) {
-                if (sendREJ(address) < 0) {
-                    return -1;
-                }
-            } else {
-                packet[bytesRead++] = byte;
-                received++;
+                // Reset destuffed index for the next packet
+                destuffedIndex = 0;
             }
-            state = START;
+            // Mark the start of a new packet
+            isPacketStarted = 1;
+        } else if (byte == ESC) {
+            // Next byte is escaped, flag escape mode
+            inEscapeMode = 1;
+        } else {
+            if (inEscapeMode) {
+                byte ^= 0x20;  // Unstuff the byte
+                inEscapeMode = 0;
+            }
+            // Add byte to destuffed packet if we have started a valid packet
+            if (isPacketStarted) {
+                if (destuffedIndex < sizeof(destuffedPacket)) {
+                    destuffedPacket[destuffedIndex++] = byte;
+                } else {
+                    perror("Buffer overflow detected");
+                    exit(-1);
+                }
+            }
         }
     }
 
-    return bytesRead;
+    return -1;  // In case of error
 }
 
 
 ////////////////////////////////////////////////
 // LLCLOSE
 ////////////////////////////////////////////////
-int llclose(int showStatistics) {
-    if (linkLayer.role == LlTx) {
-        if (llclose_transmitter() < 0) return -1;
-    }
-    else if (linkLayer.role == LlRx) {
-        if (llclose_receiver() < 0) return -1;
-    }
-    else return -1;
-
+int llclose(int showStatistics)
+{
     int clstat = closeSerialPort();
-
-    if (showStatistics) {
-        //statistics(statistics);
-    }
-
     return clstat;
 }
 
-int llopen_receiver() {
-    State state = START;
-    unsigned char byte, address, control, bcc;
-    
-    while (!isStateFinal(state)) {
-        if (readByteSerialPort(&byte) < 0) {
-            printf("Read error\n");
-            return -1;
-        } else if (readByteSerialPort(&byte) == 0) {
-            continue;
-        }
+int llopenReceiver()
+{
+    unsigned char byte;
 
-        state = processState(state, byte, &address, &control, &bcc);
-    }
-
-    return sendACK();
-}
-
-
-int llopen_transmitter() {
-    extern int alarmEnabled;
-    extern int alarmCount;
-    alarmCount = 0;
-    alarmEnabled = FALSE;
-    unsigned int attempts = 0;
-    (void)signal(SIGALRM, alarmHandler);
-
-    while (attempts < linkLayer.nRetransmissions) {
-        attempts++;
-        if (sendSET() < 0) {
-            printf("Error sending SET frame");
-            alarm(0);
-            continue;
-        }
-        alarmEnabled = TRUE;
-        State state = START;
-        alarm(linkLayer.timeout);
-
-        while (alarmEnabled) {
-            unsigned char address, control, bcc;
-            unsigned char byte = 0;
-            if (readByteSerialPort(&byte) == 0) {
-                continue;
-            }
-
-            if (readByteSerialPort(&byte) < 0) {
-                printf("Read error\n");
-                return -1;
-            }
-            state = processState(state, byte, &address, &control, &bcc);
-            if (state == STOP) {
-                alarm(0);
-                alarmEnabled = FALSE;
-                return 1;
-            }
-        }
-    }
-    printf("Connection failed: UA frame not received after %d retries.\n", linkLayer.nRetransmissions);
-    return -1;
-}
-
-
-int llclose_receiver() {
-    State state = START;
-    unsigned char byte, address, control, bcc;
-
-    while (!isStateFinal(state)) {
-        if (readByteSerialPort(&byte) == 1) {
-            state = processState(state, byte, &address, &control, &bcc);
-        }
-    }
-
-    if (control != DISC) {
-        printf("Expected DISC frame, but got something else\n");
-        return -1;
-    }
-
-    unsigned char discFrame[5] = {FLAG, A_RX, DISC, 0, FLAG};
-    discFrame[3] = discFrame[1] ^ discFrame[2];
-    if (writeBytesSerialPort(discFrame, sizeof(discFrame)) < 0) {
-        perror("Error sending DISC frame");
-        return -1;
-    }
-
-    while (!isStateFinal(state)) {
-        if (readByteSerialPort(&byte) == 1) {
-            state = processState(state, byte, &address, &control, &bcc);
-        }
-    }
-
-    if (control != UA) {
-        printf("Expected UA frame, but got something else\n");
-        return -1;
-    }
-    return 1;
-}
-
-int llclose_transmitter() {
-    unsigned char discFrame[5] = {FLAG, A_TX, DISC, 0, FLAG};
-    discFrame[3] = discFrame[1] ^ discFrame[2];
-
-    if (writeBytesSerialPort(discFrame, sizeof(discFrame)) < 0) {
-        perror("Error sending DISC frame");
-        return -1;
-    }
-
-    State state = START;
-    unsigned char byte, address, control, bcc;
-
-    while (!isStateFinal(state)) {
-        if (readByteSerialPort(&byte) == 1) {
-            state = processState(state, byte, &address, &control, &bcc);
-        }
-    }
-
-    if (control != DISC) {
-        printf("Expected DISC frame, but got something else\n");
-        return -1;
-    }
-
-    unsigned char uaFrame[5] = {FLAG, A_TX, UA, 0, FLAG};
-    uaFrame[3] = uaFrame[1] ^ uaFrame[2];
-    if (writeBytesSerialPort(uaFrame, sizeof(uaFrame)) < 0) {
-        perror("Error sending UA frame");
-        return -1;
-    }
-    return 1;
-}
-
-int sendDataFrame(const unsigned char *buf, int bufSize) {
-    unsigned char frame[bufSize + 6];
-    frame[0] = FLAG;
-    frame[1] = A_TX;
-    frame[2] = ns ? 0x40 : 0x00;
-    frame[3] = frame[1] ^ frame[2];
-
-    for (int i = 0; i < bufSize; i++) {
-        frame[i + 4] = buf[i];
-    }
-
-    unsigned char bcc2 = 0;
-    for (int i = 0; i < bufSize; i++) {
-        bcc2 ^= buf[i];
-    }
-    frame[bufSize + 4] = bcc2;
-    frame[bufSize + 5] = FLAG;
-
-    alarmCount = 0;
-    while (alarmCount < linkLayer.nRetransmissions) {
-        alarmEnabled = 1;
-
-        if (writeBytesSerialPort(frame, bufSize + 6) < 0) {
-            perror("Error sending data frame");
-            return -1;
-        }
-
-        alarm(linkLayer.timeout);
-        unsigned char byte;
-        State state = START;
-
-        while (alarmEnabled) {
-            if (readByteSerialPort(&byte) == 1) {
-                state = processState(state, byte, NULL, NULL, NULL);
-                if (state == RR) {
-                    printf("Received RR for frame with NS = %d\n", ns);
-                    ns = (ns + 1) % 2;
-                    alarm(0);
-                    return bufSize;
-                } else if (state == REJ) {
-                    printf("Received REJ for frame with NS = %d\n", ns);
+    while (state != STOP) {
+        if (readByteSerialPort(&byte) > 0) {
+            printf("Received byte: 0x%02X\n", byte);
+            switch (state) {
+                case START:
+                    if (byte == FLAG)
+                        state = FLAG_RCV;
                     break;
-                }
+                case FLAG_RCV:
+                    if (byte == A_TX)
+                        state = A_RCV;
+                    else if (byte != FLAG)
+                        state = START;
+                    break;
+                case A_RCV:
+                    if (byte == SET)
+                        state = C_RCV;
+                    else if (byte == FLAG)
+                        state = FLAG_RCV;
+                    else
+                        state = START;
+                    break;
+                case C_RCV:
+                    if (byte == (A_TX ^ SET))
+                        state = BCC_OK;
+                    else if (byte == FLAG)
+                        state = FLAG_RCV;
+                    else
+                        state = START;
+                    break;
+                case BCC_OK:
+                    if (byte == FLAG)
+                        state = STOP;
+                    else
+                        state = START;
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    unsigned char buf[5] = {FLAG, A_RX, UA, A_RX ^ UA, FLAG};
+    if (writeBytesSerialPort(buf, 5) == -1) {
+        perror("Failed to write UA\n");
+        return -1;
+    }
+    return 1;
+}
+
+
+int llopenTransmitter(LinkLayer connectionParameters)
+{
+    (void)signal(SIGALRM, alarmHandler);
+    unsigned char byte;
+    unsigned char buf[5] = {FLAG, A_TX, SET, A_TX ^ SET, FLAG};
+
+    while (state != STOP && connectionParameters.nRetransmissions > 0) {
+        alarm(connectionParameters.timeout);
+        alarmEnabled = FALSE;
+
+        if (writeBytesSerialPort(buf, 5) == -1) {
+            perror("Failed to write SET\n");
+            exit(-1);
+        }
+
+        while (state != STOP && alarmEnabled == FALSE) {
+            if (readByteSerialPort(&byte) > 0) {
+                printf("Received byte: 0x%02X\n", byte);
+                updateStateTransmitter(&state, byte);
             }
         }
 
-        if (alarmCount >= linkLayer.nRetransmissions) {
-            printf("Maximum retries reached. Frame sending failed.\n");
-            return -1;
-        }
+        connectionParameters.nRetransmissions -= 1;
     }
-    return -1;
-}
 
-int sendSET() {
-    unsigned char buf[5] = {FLAG, A_TX, SET, 0x00, FLAG};
-    buf[3] = buf[1] ^ buf[2];
-
-    if (writeBytes(buf, sizeof(buf)) < 0) {
-        printf("Failed to send SET frame.\n");
+    if (state != STOP) {
+        perror("llopen error\n");
         return -1;
     }
-
     return 1;
-}
-
-
-int sendACK() {
-    unsigned char buf[5] = {FLAG, 0x00, UA, 0x00, FLAG};
-    if (linkLayer.role == LlRx) {
-        buf[1] = A_TX;
-    }
-    else if (linkLayer.role == LlTx) {
-        buf[1] = A_RX;
-    }
-    buf[3] = buf[1] ^ buf[2];
-
-    if (writeBytes(buf, sizeof(buf)) < 0) {
-        printf("Failed to send ACK frame.\n");
-        return -1;
-    }
-
-    return 1;
-}
-
-int sendRR() {
-    unsigned char buf[5] = {FLAG, 0x03, frameNumber == 0 ? 0xAA : 0xAB, 0, FLAG};
-    buf[3] = buf[1] ^ buf[2];
-
-    if (writeBytes(buf, sizeof(buf)) < 0) {
-        printf("Failed to send RR frame (RR%d).\n", frameNumber);
-        return -1;
-    }
-
-    return 1;
-}
-
-int sendREJ() {
-    unsigned char buf[5] = {FLAG, 0x03, frameNumber == 0 ? 0x54 : 0x55, 0, FLAG};
-    buf[3] = buf[1] ^ buf[2]; 
-
-    if (writeBytes(buf, sizeof(buf)) < 0) {
-        printf("Failed to send REJ frame (REJ%d).\n", frameNumber);
-        return -1;
-    }
-
-    return 1;
-}
-
-int writeBytes(const unsigned char *bytes, int num_bytes) {
-    int written = 0;
-    while (written < num_bytes)
-    {
-        int toWrite = num_bytes - written;
-        int bytesWritten = writeBytesSerialPort(bytes + written, toWrite);
-
-        if (bytesWritten < 0)
-        {
-            printf("Writing error.\n");
-            return -1;
-        }
-
-        written += bytesWritten;
-    }
-
-    return written;
-}
-
-int isDuplicate(unsigned char address, unsigned char control) {
-    if (address == lastAddress && control == lastControl) {
-        return 1;
-    }
-    lastAddress = address;
-    lastControl = control;
-    return 0;
-}
-
-int isValidData(unsigned char bcc, const unsigned char *data, int length) {
-    unsigned char calculated_bcc = 0;
-    for (int i = 0; i < length; i++) {
-        calculated_bcc ^= data[i];
-    }
-    return calculated_bcc == bcc;
 }

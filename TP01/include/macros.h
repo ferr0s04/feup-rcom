@@ -10,6 +10,8 @@
 #define RR 0x05
 #define REJ 0x01 
 #define DISC 0x0B
+#define ESC 0x7D
+#define C_N(seq) (seq ? 0x40 : 0x00)
 
 #define MAX_RETRIES 3
 #define TIMEOUT 3
