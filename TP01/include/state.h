@@ -10,7 +10,7 @@ typedef enum {
     STOP
 } State;
 
-int updateStateTransmitter(State *currentState, unsigned char byte);
+State nextState(State state, unsigned char byte, unsigned char control, unsigned char command);
 int isStateFinal(State state);
 
 #endif // _STATE_H_

@@ -1,49 +1,66 @@
-#include <stdio.h>
-#include <string.h>
-#include <signal.h>
-#include <unistd.h>
-#include <stdlib.h>
 #include "link_layer.h"
 #include "serial_port.h"
 #include "macros.h"
 #include "state.h"
 
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <time.h>
+
 // MISC
 #define _POSIX_SOURCE 1 // POSIX compliant source
 
-int frameNumber = 0;
-int framesReceived = 0;
-unsigned char lastAddress = 0;
-unsigned char lastControl = 0;
-State state = START;
+typedef struct {
+    int framesSent;
+    int framesReceived;
+    int retransmissions;
+    int timeouts;
+    double elapsedTime;
+} Statistics;
+
 int alarmEnabled = FALSE;
 int alarmCount = 0;
+extern int fd;
 unsigned char byte;
-unsigned char buf_tx = 0;
-
+int nr = 1;
+int ns = 0;
+unsigned char seq = 0xFF;
 LinkLayer linkLayer;
-void alarmHandler(int signal);
-int llopenReceiver();
-int llopenTransmitter(LinkLayer connectionParameters);
+Statistics statistics;
+struct timespec start, end;
 
-void alarmHandler(int signal)
-{
+void alarmHandler(int signal);
+int llopenTransmitter();
+int llopenReceiver();
+int llcloseTransmitter();
+int llcloseReceiver();
+void printStatistics();
+
+
+void alarmHandler(int signal) {
     alarmEnabled = FALSE;
     alarmCount++;
 
     printf("Alarm #%d\n", alarmCount);
-    printf("Enabled = %d\n", alarmEnabled);
 }
+
 
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
-int llopen(LinkLayer connectionParameters)
-{
-    if (openSerialPort(connectionParameters.serialPort, connectionParameters.baudRate) < 0) {
-        perror("Failed to open serial port\n");
+int llopen(LinkLayer connectionParameters) {
+    linkLayer = connectionParameters;
+    fd = openSerialPort(connectionParameters.serialPort, connectionParameters.baudRate);
+
+    if (fd < 0) {
+        perror("ERROR: failed to open serial port\n");
         exit(-1);
     }
+
+    clock_gettime(CLOCK_REALTIME, &start);
 
     switch (connectionParameters.role) {
         case LlTx:
@@ -51,221 +68,388 @@ int llopen(LinkLayer connectionParameters)
         case LlRx:
             return llopenReceiver();
         default:
-            perror("Invalid role\n");
+            perror("ERROR: invalid role at llopen\n");
             return -1;
     }
 }
+
 
 ////////////////////////////////////////////////
 // LLWRITE
 ////////////////////////////////////////////////
 int llwrite(const unsigned char *buf, int bufSize) {
-    // Frame with start/end flags, address, control fields, and BCC
-    int maxFrameSize = 6 + 2 * bufSize;  // Worst case (stuffing doubles size)
-    unsigned char *frame = (unsigned char *)malloc(maxFrameSize);
+    int isREJ = FALSE;
+    unsigned char _buf[2 * MAX_PAYLOAD_SIZE];
 
-    frame[0] = FLAG;  // Start flag
-    frame[1] = A_TX;  // Address (example address)
-    frame[2] = C_N(buf_tx);  // Control field (example control)
-    frame[3] = frame[1] ^ frame[2];  // BCC1
+    int bytes = 0;
+    alarmCount = 0;
+    alarmEnabled = FALSE;
+    State state = START;
 
-    // Calculate BCC2 over the data payload
-    unsigned char BCC2 = buf[0];
-    for (int i = 1; i < bufSize; i++) {
-        BCC2 ^= buf[i];
-    }
+    while (alarmCount < linkLayer.nRetransmissions && !isStateFinal(state)) {
+        if (alarmEnabled == FALSE || isREJ == TRUE) {
+            if (isREJ == TRUE) {
+                statistics.retransmissions++;
+                alarmCount++;
+            }
 
-    // Copy data and apply byte stuffing
-    int stuffedIndex = 4;
-    for (int i = 0; i < bufSize; i++) {
-        if (buf[i] == FLAG || buf[i] == ESC) {
-            frame[stuffedIndex++] = ESC;
-            frame[stuffedIndex++] = buf[i] ^ 0x20;  // XOR with 0x20 after ESC
-        } else {
-            frame[stuffedIndex++] = buf[i];
+            (void)signal(SIGALRM, alarmHandler);
+
+            _buf[0] = FLAG;
+            _buf[1] = A_TX;
+            _buf[2] = (ns << 7);
+            _buf[3] = _buf[1] ^ _buf[2];
+
+            int i, j = 0;
+            unsigned char bcc2 = 0;
+            for (i = 0; i < bufSize; i++) {
+                bcc2 ^= buf[i];
+
+                if (buf[i] == FLAG || buf[i] == ESC) {
+                    _buf[4 + i + j] = ESC;
+                    _buf[4 + i + j + 1] = ESC_BCC2 & buf[i];
+                    j++;
+                }
+                else {
+                    _buf[4 + i + j] = buf[i];
+                }
+            }
+
+            if (bcc2 == FLAG || bcc2 == ESC) {
+                _buf[4 + i + j] = ESC;
+                _buf[4 + i + j + 1] = ESC_BCC2 & bcc2;
+                j++;
+            }
+            else {
+                _buf[4 + i + j] = bcc2;
+            }
+            _buf[5 + i + j] = FLAG;
+
+            bytes = write(fd, _buf, 6 + i + j);
+
+            if (bytes < 0) exit(-1);
+            statistics.framesSent++;
+
+            state = START;
+            alarm(linkLayer.timeout);
+            alarmEnabled = TRUE;
+        }
+
+        if (read(fd, _buf, 1) == 0) {
+            statistics.timeouts++;
+            continue;
+        }
+
+        state = nextState(state, *_buf, A_TX, (RR | (nr << 7)));
+        if (isStateFinal(state)) {
+            printf("RR received\n");
+            break;
+        }
+        else if (isREJ) {
+            printf("REJ received\n");
+            read(fd, _buf, 1);
+            read(fd, _buf, 1);
         }
     }
 
-    // Add BCC2 with stuffing
-    if (BCC2 == FLAG || BCC2 == ESC) {
-        frame[stuffedIndex++] = ESC;
-        frame[stuffedIndex++] = BCC2 ^ 0x20;
-    } else {
-        frame[stuffedIndex++] = BCC2;
+    if (isStateFinal(state)) {
+        nr = ns;
+        ns = (ns + 1) % 2;
+        return bytes;
     }
-
-    frame[stuffedIndex++] = FLAG;  // End flag
-
-    // Write the frame to the serial port
-    if (writeBytesSerialPort(frame, stuffedIndex) < 0) {
-        perror("Failed to write frame");
-        free(frame);
+    else {
+        perror("ERROR: llwrite\n");
         return -1;
     }
-
-    free(frame);
-    return bufSize;
 }
+
 
 ////////////////////////////////////////////////
 // LLREAD
 ////////////////////////////////////////////////
 int llread(unsigned char *packet) {
-    unsigned char byte;
-    unsigned char destuffedPacket[1024];
-    int destuffedIndex = 0;
-    int inEscapeMode = 0;
-    int isPacketStarted = 0; // To track if we have started receiving a valid packet
+    int isREJ = FALSE;
+    unsigned char buf[6];
+    State state = START;
 
-    while (1) {
-        if (readByteSerialPort(&byte) < 0) {
-            perror("Failed to read byte from serial port");
-            exit(-1);
+    while (state != BCC_OK)
+    {
+        if (read(fd, buf, 1) == 0) continue;
+
+        if (state == A_RCV && (*buf == (0 << 7) || (*buf == (1 << 7)))) {
+            ns = (*buf >> 7);
+            nr = (ns + 1) % 2;
         }
 
-        // Check for the start flag
-        if (byte == FLAG) {
-            // If we have previously started receiving a packet, it means we have a complete packet
-            if (isPacketStarted) {
-                // Validate and process the complete frame
-                if (destuffedIndex > 0) {
-                    // Validate BCC2
-                    unsigned char bcc2 = destuffedPacket[destuffedIndex - 1]; // Last byte is BCC2
-                    destuffedIndex--;  // Remove BCC2 from the packet
-
-                    // Calculate BCC2 over the destuffed data
-                    unsigned char acc = destuffedPacket[0];
-                    for (int j = 1; j < destuffedIndex; j++) {
-                        acc ^= destuffedPacket[j];
-                    }
-
-                    // Validate BCC2
-                    if (bcc2 == acc) {
-                        memcpy(packet, destuffedPacket, destuffedIndex);
-                        return destuffedIndex;  // Return size of the valid data
-                    }
-                }
-                // Reset destuffed index for the next packet
-                destuffedIndex = 0;
-            }
-            // Mark the start of a new packet
-            isPacketStarted = 1;
-        } else if (byte == ESC) {
-            // Next byte is escaped, flag escape mode
-            inEscapeMode = 1;
-        } else {
-            if (inEscapeMode) {
-                byte ^= 0x20;  // Unstuff the byte
-                inEscapeMode = 0;
-            }
-            // Add byte to destuffed packet if we have started a valid packet
-            if (isPacketStarted) {
-                if (destuffedIndex < sizeof(destuffedPacket)) {
-                    destuffedPacket[destuffedIndex++] = byte;
-                } else {
-                    perror("Buffer overflow detected");
-                    exit(-1);
-                }
-            }
-        }
+        state = nextState(state, *buf, A_TX, ns << 7);
+        if (state == START) return 0;
     }
 
-    return -1;  // In case of error
+    unsigned char bcc2 = 0;
+    int i = 0, data = 0;
+    while (!isStateFinal(state))
+    {
+        if (state == START || isREJ)
+            break;
+
+        if (read(fd, buf, 1) == 0)
+            continue;
+
+        if (i == 0)
+            data = (*buf == 1);
+
+        if (i == 1 && data) {
+            printf("#%d \n", *buf);
+            if (seq == *buf) {
+                state = START;
+                printf("Duplicated packet\n");
+                break;
+            }
+            seq = *buf;
+        }
+
+        if (*buf == FLAG) {
+            state = STOP;
+            break;
+        }
+
+        if (*buf == ESC) {
+            while (*buf == ESC)
+                read(fd, buf, 1);
+
+            if (*buf == ESC_FLAG) *buf = FLAG;
+            else if (*buf == ESC_ESC) *buf = ESC;
+        }
+
+        *(packet + i) = *buf;
+        i++;
+        bcc2 ^= *buf;
+    }
+
+    if (bcc2 != 0) {
+        printf("Wrong BCC2\n");
+        isREJ = TRUE;
+        seq--;
+    }
+
+    *(packet + i) = '\0';
+    i--;
+
+    buf[0] = FLAG;
+    buf[1] = A_TX;
+    buf[2] = (isREJ == FALSE ? RR : REJ) | (nr << 7);
+    buf[3] = buf[1] ^ buf[2];
+    buf[4] = FLAG;
+
+    write(fd, buf, 6);
+    printf("%s sent\n", isREJ == FALSE ? "RR" : "REJ");
+
+    if (isREJ == TRUE) return 0;
+    statistics.framesReceived++;
+    return i;
 }
 
 
 ////////////////////////////////////////////////
 // LLCLOSE
 ////////////////////////////////////////////////
-int llclose(int showStatistics)
-{
-    int clstat = closeSerialPort();
+int llclose(int showStatistics) {   
+    int clstat;
+
+    if (linkLayer.role == LlTx) {
+        llcloseTransmitter();
+    } else if (linkLayer.role == LlRx) {
+        llcloseReceiver();
+    } else {
+        perror("ERROR: invalid role at llclose\n");
+        return -1;
+    }
+
+    clock_gettime(CLOCK_REALTIME, &end);
+    statistics.elapsedTime = (end.tv_sec-start.tv_sec)+ (end.tv_nsec-start.tv_nsec)/1e9;
+
+    clstat = closeSerialPort();
+    
+    if (showStatistics) {
+        printStatistics();
+    }
+    
     return clstat;
 }
 
-int llopenReceiver()
-{
-    unsigned char byte;
 
-    while (state != STOP) {
-        if (readByteSerialPort(&byte) > 0) {
-            printf("Received byte: 0x%02X\n", byte);
-            switch (state) {
-                case START:
-                    if (byte == FLAG)
-                        state = FLAG_RCV;
-                    break;
-                case FLAG_RCV:
-                    if (byte == A_TX)
-                        state = A_RCV;
-                    else if (byte != FLAG)
-                        state = START;
-                    break;
-                case A_RCV:
-                    if (byte == SET)
-                        state = C_RCV;
-                    else if (byte == FLAG)
-                        state = FLAG_RCV;
-                    else
-                        state = START;
-                    break;
-                case C_RCV:
-                    if (byte == (A_TX ^ SET))
-                        state = BCC_OK;
-                    else if (byte == FLAG)
-                        state = FLAG_RCV;
-                    else
-                        state = START;
-                    break;
-                case BCC_OK:
-                    if (byte == FLAG)
-                        state = STOP;
-                    else
-                        state = START;
-                    break;
-                default:
-                    break;
+int llopenTransmitter() {
+    unsigned char buf[5] = {FLAG, A_TX, SET, A_TX ^ SET, FLAG};
+    State state = START;
+    int bytes;
+
+    while (!isStateFinal(state) && linkLayer.nRetransmissions > alarmCount) {
+        if (alarmEnabled == FALSE) {
+            (void)signal(SIGALRM, alarmHandler);
+            alarm(linkLayer.timeout);
+
+            if (writeBytesSerialPort(buf, 5) == -1) {
+            perror("ERROR: failed to write SET\n");
+            exit(-1);
             }
+
+            state = START;
+            alarmEnabled = TRUE;
+        }
+
+        if ((bytes = read(fd, buf, 1)) <= 0) {
+            if (bytes < 0) exit(-1);
+            continue;
+        }
+
+        state = nextState(state, *buf, A_TX, UA);
+
+        if (isStateFinal(state)) {
+            printf("UA received\n");
+            break;
         }
     }
 
-    unsigned char buf[5] = {FLAG, A_RX, UA, A_RX ^ UA, FLAG};
-    if (writeBytesSerialPort(buf, 5) == -1) {
-        perror("Failed to write UA\n");
-        return -1;
-    }
+    if (!isStateFinal(state)) return -1;
     return 1;
 }
 
 
-int llopenTransmitter(LinkLayer connectionParameters)
-{
-    (void)signal(SIGALRM, alarmHandler);
-    unsigned char byte;
-    unsigned char buf[5] = {FLAG, A_TX, SET, A_TX ^ SET, FLAG};
+int llopenReceiver() {
+    unsigned char buf[5];
+    State state = START;
 
-    while (state != STOP && connectionParameters.nRetransmissions > 0) {
-        alarm(connectionParameters.timeout);
-        alarmEnabled = FALSE;
+    while (1) {
+        int bytes;
+        if ((bytes = read(fd, buf, 1)) == 0) continue;
 
-        if (writeBytesSerialPort(buf, 5) == -1) {
-            perror("Failed to write SET\n");
-            exit(-1);
+        state = nextState(state, *buf, A_TX, SET);
+        if (isStateFinal(state)) {
+            printf("SET received\n");
+            break;
         }
-
-        while (state != STOP && alarmEnabled == FALSE) {
-            if (readByteSerialPort(&byte) > 0) {
-                printf("Received byte: 0x%02X\n", byte);
-                updateStateTransmitter(&state, byte);
-            }
-        }
-
-        connectionParameters.nRetransmissions -= 1;
     }
 
-    if (state != STOP) {
-        perror("llopen error\n");
+    buf[0] = FLAG;
+    buf[1] = A_TX;
+    buf[2] = UA;
+    buf[3] = buf[1] ^ buf[2];
+    buf[4] = FLAG;
+
+    write(fd, buf, 5);
+    printf("UA sent\n");
+
+    return 1;
+}
+
+
+int llcloseTransmitter() {
+    alarmEnabled = FALSE;
+    alarmCount = 0;
+
+    unsigned char buf[BUFFER_SIZE + 1] = {FLAG, A_TX, DISC, A_TX ^ DISC, FLAG}, _buf[BUFFER_SIZE + 1];
+
+    State state = START;
+    while (alarmCount < linkLayer.nRetransmissions && !isStateFinal(state)) {
+        if (alarmEnabled == FALSE) {
+            (void)signal(SIGALRM, alarmHandler);
+
+            write(fd, buf, 6);
+            printf("DISC sent\n");
+
+            state = START;
+
+            alarm(linkLayer.timeout);
+            alarmEnabled = TRUE;
+        }
+
+        int bytes = read(fd, _buf, 1);
+        if (bytes < 0) exit(-1);
+        else if (bytes == 0) continue;
+
+        state = nextState(state, *_buf, A_RX, DISC);
+        if (isStateFinal(state)) {
+            printf("DISC received\n");
+        }
+    }
+
+    if (!isStateFinal(state)) {
+        perror("ERROR: llclose\n");
         return -1;
     }
+
+    buf[0] = FLAG;
+    buf[1] = A_RX;
+    buf[2] = UA;
+    buf[3] = buf[1] ^ buf[2];
+    buf[4] = FLAG;
+
+    if (!write(fd, buf, 6)) {
+        perror("ERROR: UA\n");
+        exit(-1);
+    }
+
+    printf("UA sent\n");
+
     return 1;
+}
+
+
+int llcloseReceiver() {
+    unsigned char buf[BUFFER_SIZE + 1] = {0};
+    State state = START;
+    while (1) {
+        if (read(fd, buf, 1) == 0) continue;
+
+        state = nextState(state, *buf, A_TX, DISC);
+        if (isStateFinal(state)) {
+            printf("DISC received\n");
+            break;
+        }
+    }
+
+    unsigned char _buf[BUFFER_SIZE + 1] = {FLAG, A_RX, DISC, A_RX ^ DISC, FLAG, '\0'};
+    alarmEnabled = FALSE;
+    alarmCount = 0;
+    state = START;
+
+    while (alarmCount < linkLayer.nRetransmissions && !isStateFinal(state)) {
+
+        if (alarmEnabled == FALSE) {
+            (void)signal(SIGALRM, alarmHandler);
+
+            write(fd, _buf, 6);
+            printf("DISC sent\n");
+
+            state = START;
+
+            alarm(linkLayer.timeout);
+            alarmEnabled = TRUE;
+        }
+
+        int bytes = read(fd, _buf, 1);
+        if (bytes < 0) exit(-1);
+        if (bytes == 0) continue;
+
+        state = nextState(state, *_buf, A_RX, UA);
+        if (isStateFinal(state)) {
+            printf("UA received\n");
+            break;
+        }
+    }
+
+    if (!isStateFinal(state)) return -1;
+    return 1;
+}
+
+
+void printStatistics() {
+    printf("\n");
+    printf("Communication Statistics:\n");
+    printf("Frames Sent: %d\n", statistics.framesSent);
+    printf("Frames Received: %d\n", statistics.framesReceived);
+    printf("Retransmissions: %d\n", statistics.retransmissions);
+    printf("Timeouts: %d\n", statistics.timeouts);
+    printf("\n");
+    printf("Elapsed Time: %.2f s\n", statistics.elapsedTime);
 }
