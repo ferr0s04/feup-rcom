@@ -18,6 +18,9 @@ typedef struct {
     int framesReceived;
     int retransmissions;
     int timeouts;
+    int receivedRR;
+    int receivedREJ;
+    int receivedDuplicate;
     double elapsedTime;
 } Statistics;
 
@@ -38,6 +41,7 @@ int llopenReceiver();
 int llcloseTransmitter();
 int llcloseReceiver();
 void printStatistics();
+int buildPacket(const unsigned char *buf, int bufSize, unsigned char *packet, int ns);
 
 
 void alarmHandler(int signal) {
@@ -56,7 +60,7 @@ int llopen(LinkLayer connectionParameters) {
     fd = openSerialPort(connectionParameters.serialPort, connectionParameters.baudRate);
 
     if (fd < 0) {
-        perror("ERROR: failed to open serial port\n");
+        printf("ERROR: failed to open serial port\n");
         exit(-1);
     }
 
@@ -68,7 +72,7 @@ int llopen(LinkLayer connectionParameters) {
         case LlRx:
             return llopenReceiver();
         default:
-            perror("ERROR: invalid role at llopen\n");
+            printf("ERROR: invalid role at llopen\n");
             return -1;
     }
 }
@@ -78,64 +82,37 @@ int llopen(LinkLayer connectionParameters) {
 // LLWRITE
 ////////////////////////////////////////////////
 int llwrite(const unsigned char *buf, int bufSize) {
-    int isREJ = FALSE;
     unsigned char _buf[2 * MAX_PAYLOAD_SIZE];
 
     int bytes = 0;
     alarmCount = 0;
     alarmEnabled = FALSE;
-    State state = START;
+    StateMachine state = createStateMachine();
 
     while (alarmCount < linkLayer.nRetransmissions && !isStateFinal(state)) {
-        if (alarmEnabled == FALSE || isREJ == TRUE) {
-            if (isREJ == TRUE) {
+        if (alarmEnabled == FALSE || state.isREJ == TRUE) {
+            if (state.isREJ == TRUE) {
                 statistics.retransmissions++;
                 alarmCount++;
+                state.state = START;
+                state.isREJ = FALSE;
+                alarmEnabled = FALSE;
+                continue;
             }
 
             (void)signal(SIGALRM, alarmHandler);
-
-            _buf[0] = FLAG;
-            _buf[1] = A_TX;
-            _buf[2] = (ns << 7);
-            _buf[3] = _buf[1] ^ _buf[2];
-
-            int i, j = 0;
-            unsigned char bcc2 = 0;
-            for (i = 0; i < bufSize; i++) {
-                bcc2 ^= buf[i];
-
-                if (buf[i] == FLAG || buf[i] == ESC) {
-                    _buf[4 + i + j] = ESC;
-                    _buf[4 + i + j + 1] = ESC_BCC2 & buf[i];
-                    j++;
-                }
-                else {
-                    _buf[4 + i + j] = buf[i];
-                }
-            }
-
-            if (bcc2 == FLAG || bcc2 == ESC) {
-                _buf[4 + i + j] = ESC;
-                _buf[4 + i + j + 1] = ESC_BCC2 & bcc2;
-                j++;
-            }
-            else {
-                _buf[4 + i + j] = bcc2;
-            }
-            _buf[5 + i + j] = FLAG;
-
-            bytes = write(fd, _buf, 6 + i + j);
+            int packetSize = buildPacket(buf, bufSize, _buf, ns);
+            bytes = writeBytesSerialPort(_buf, packetSize);
 
             if (bytes < 0) exit(-1);
             statistics.framesSent++;
 
-            state = START;
+            state.state = START;
             alarm(linkLayer.timeout);
             alarmEnabled = TRUE;
         }
 
-        if (read(fd, _buf, 1) == 0) {
+        if (readByteSerialPort(_buf) == 0) {
             statistics.timeouts++;
             continue;
         }
@@ -143,12 +120,14 @@ int llwrite(const unsigned char *buf, int bufSize) {
         state = nextState(state, *_buf, A_TX, (RR | (nr << 7)));
         if (isStateFinal(state)) {
             printf("RR received\n");
+            statistics.receivedRR++;
+            statistics.framesReceived++;
             break;
-        }
-        else if (isREJ) {
+        } else if (state.isREJ == TRUE) {
             printf("REJ received\n");
-            read(fd, _buf, 1);
-            read(fd, _buf, 1);
+            statistics.receivedREJ++;
+            readByteSerialPort(_buf);
+            readByteSerialPort(_buf);
         }
     }
 
@@ -156,9 +135,8 @@ int llwrite(const unsigned char *buf, int bufSize) {
         nr = ns;
         ns = (ns + 1) % 2;
         return bytes;
-    }
-    else {
-        perror("ERROR: llwrite\n");
+    } else {
+        printf("ERROR: llwrite\n");
         return -1;
     }
 }
@@ -168,54 +146,55 @@ int llwrite(const unsigned char *buf, int bufSize) {
 // LLREAD
 ////////////////////////////////////////////////
 int llread(unsigned char *packet) {
-    int isREJ = FALSE;
     unsigned char buf[6];
-    State state = START;
+    StateMachine state = createStateMachine();
 
-    while (state != BCC_OK)
+    while (state.state != BCC_OK)
     {
-        if (read(fd, buf, 1) == 0) continue;
+        if (readByteSerialPort(buf) == 0) continue;
 
-        if (state == A_RCV && (*buf == (0 << 7) || (*buf == (1 << 7)))) {
+        if (state.state == A_RCV && (*buf == (0 << 7) || (*buf == (1 << 7)))) {
             ns = (*buf >> 7);
             nr = (ns + 1) % 2;
         }
 
         state = nextState(state, *buf, A_TX, ns << 7);
-        if (state == START) return 0;
+        if (state.ignore == TRUE) return 0;
     }
 
     unsigned char bcc2 = 0;
     int i = 0, data = 0;
+
     while (!isStateFinal(state))
     {
-        if (state == START || isREJ)
+        if (state.ignore == TRUE || state.isREJ == TRUE)
             break;
 
-        if (read(fd, buf, 1) == 0)
+        if (readByteSerialPort(buf) == 0)
             continue;
 
         if (i == 0)
             data = (*buf == 1);
 
         if (i == 1 && data) {
-            printf("#%d \n", *buf);
+            printf("Packet #%d \n", *buf);
             if (seq == *buf) {
-                state = START;
+                state.ignore = TRUE;
                 printf("Duplicated packet\n");
+                statistics.receivedDuplicate++;
                 break;
             }
             seq = *buf;
         }
 
         if (*buf == FLAG) {
-            state = STOP;
+            state.state = STOP;
             break;
         }
 
         if (*buf == ESC) {
             while (*buf == ESC)
-                read(fd, buf, 1);
+                readByteSerialPort(buf);
 
             if (*buf == ESC_FLAG) *buf = FLAG;
             else if (*buf == ESC_ESC) *buf = ESC;
@@ -228,7 +207,7 @@ int llread(unsigned char *packet) {
 
     if (bcc2 != 0) {
         printf("Wrong BCC2\n");
-        isREJ = TRUE;
+        state.isREJ = TRUE;
         seq--;
     }
 
@@ -237,14 +216,14 @@ int llread(unsigned char *packet) {
 
     buf[0] = FLAG;
     buf[1] = A_TX;
-    buf[2] = (isREJ == FALSE ? RR : REJ) | (nr << 7);
+    buf[2] = (state.isREJ == FALSE ? RR : REJ) | (nr << 7);
     buf[3] = buf[1] ^ buf[2];
     buf[4] = FLAG;
 
-    write(fd, buf, 6);
-    printf("%s sent\n", isREJ == FALSE ? "RR" : "REJ");
+    writeBytesSerialPort(buf, 6);
+    printf("%s sent\n", state.isREJ == FALSE ? "RR" : "REJ");
 
-    if (isREJ == TRUE) return 0;
+    if (state.isREJ == TRUE) return 0;
     statistics.framesReceived++;
     return i;
 }
@@ -261,7 +240,7 @@ int llclose(int showStatistics) {
     } else if (linkLayer.role == LlRx) {
         llcloseReceiver();
     } else {
-        perror("ERROR: invalid role at llclose\n");
+        printf("ERROR: invalid role at llclose\n");
         return -1;
     }
 
@@ -280,7 +259,7 @@ int llclose(int showStatistics) {
 
 int llopenTransmitter() {
     unsigned char buf[5] = {FLAG, A_TX, SET, A_TX ^ SET, FLAG};
-    State state = START;
+    StateMachine state = createStateMachine();
     int bytes;
 
     while (!isStateFinal(state) && linkLayer.nRetransmissions > alarmCount) {
@@ -289,17 +268,21 @@ int llopenTransmitter() {
             alarm(linkLayer.timeout);
 
             if (writeBytesSerialPort(buf, 5) == -1) {
-            perror("ERROR: failed to write SET\n");
+            printf("ERROR: failed to write SET\n");
             exit(-1);
             }
 
-            state = START;
+            state.state = START;
             alarmEnabled = TRUE;
         }
 
-        if ((bytes = read(fd, buf, 1)) <= 0) {
+        if ((bytes = readByteSerialPort(buf)) <= 0) {
             if (bytes < 0) exit(-1);
             continue;
+        }
+
+        if (state.ignore == TRUE) {
+            state.state = START;
         }
 
         state = nextState(state, *buf, A_TX, UA);
@@ -317,11 +300,16 @@ int llopenTransmitter() {
 
 int llopenReceiver() {
     unsigned char buf[5];
-    State state = START;
+    StateMachine state = createStateMachine();
 
     while (1) {
+
+        if (state.ignore == TRUE) {
+            state.state = START;
+        }
+
         int bytes;
-        if ((bytes = read(fd, buf, 1)) == 0) continue;
+        if ((bytes = readByteSerialPort(buf)) == 0) continue;
 
         state = nextState(state, *buf, A_TX, SET);
         if (isStateFinal(state)) {
@@ -336,7 +324,7 @@ int llopenReceiver() {
     buf[3] = buf[1] ^ buf[2];
     buf[4] = FLAG;
 
-    write(fd, buf, 5);
+    writeBytesSerialPort(buf, 5);
     printf("UA sent\n");
 
     return 1;
@@ -349,21 +337,21 @@ int llcloseTransmitter() {
 
     unsigned char buf[BUFFER_SIZE + 1] = {FLAG, A_TX, DISC, A_TX ^ DISC, FLAG}, _buf[BUFFER_SIZE + 1];
 
-    State state = START;
+    StateMachine state = createStateMachine();
     while (alarmCount < linkLayer.nRetransmissions && !isStateFinal(state)) {
         if (alarmEnabled == FALSE) {
             (void)signal(SIGALRM, alarmHandler);
 
-            write(fd, buf, 6);
+            writeBytesSerialPort(buf, 6);
             printf("DISC sent\n");
 
-            state = START;
+            state.state = START;
 
             alarm(linkLayer.timeout);
             alarmEnabled = TRUE;
         }
 
-        int bytes = read(fd, _buf, 1);
+        int bytes = readByteSerialPort(_buf);
         if (bytes < 0) exit(-1);
         else if (bytes == 0) continue;
 
@@ -374,7 +362,7 @@ int llcloseTransmitter() {
     }
 
     if (!isStateFinal(state)) {
-        perror("ERROR: llclose\n");
+        printf("ERROR: llclose\n");
         return -1;
     }
 
@@ -384,8 +372,8 @@ int llcloseTransmitter() {
     buf[3] = buf[1] ^ buf[2];
     buf[4] = FLAG;
 
-    if (!write(fd, buf, 6)) {
-        perror("ERROR: UA\n");
+    if (!writeBytesSerialPort(buf, 6)) {
+        printf("ERROR: UA\n");
         exit(-1);
     }
 
@@ -397,9 +385,9 @@ int llcloseTransmitter() {
 
 int llcloseReceiver() {
     unsigned char buf[BUFFER_SIZE + 1] = {0};
-    State state = START;
+    StateMachine state = createStateMachine();
     while (1) {
-        if (read(fd, buf, 1) == 0) continue;
+        if (readByteSerialPort(buf) == 0) continue;
 
         state = nextState(state, *buf, A_TX, DISC);
         if (isStateFinal(state)) {
@@ -411,23 +399,23 @@ int llcloseReceiver() {
     unsigned char _buf[BUFFER_SIZE + 1] = {FLAG, A_RX, DISC, A_RX ^ DISC, FLAG, '\0'};
     alarmEnabled = FALSE;
     alarmCount = 0;
-    state = START;
+    state.state = START;
 
     while (alarmCount < linkLayer.nRetransmissions && !isStateFinal(state)) {
 
         if (alarmEnabled == FALSE) {
             (void)signal(SIGALRM, alarmHandler);
 
-            write(fd, _buf, 6);
+            writeBytesSerialPort(_buf, 6);
             printf("DISC sent\n");
 
-            state = START;
+            state.state = START;
 
             alarm(linkLayer.timeout);
             alarmEnabled = TRUE;
         }
 
-        int bytes = read(fd, _buf, 1);
+        int bytes = readByteSerialPort(_buf);
         if (bytes < 0) exit(-1);
         if (bytes == 0) continue;
 
@@ -448,8 +436,44 @@ void printStatistics() {
     printf("Communication Statistics:\n");
     printf("Frames Sent: %d\n", statistics.framesSent);
     printf("Frames Received: %d\n", statistics.framesReceived);
+    printf("RR Received: %d\n", statistics.receivedRR);
+    printf("REJ Received: %d\n", statistics.receivedREJ);
+    printf("Duplicates Received: %d\n", statistics.receivedDuplicate);
     printf("Retransmissions: %d\n", statistics.retransmissions);
     printf("Timeouts: %d\n", statistics.timeouts);
     printf("\n");
     printf("Elapsed Time: %.2f s\n", statistics.elapsedTime);
 }
+
+
+int buildPacket(const unsigned char *buf, int bufSize, unsigned char *packet, int ns) {
+    packet[0] = FLAG;
+    packet[1] = A_TX;
+    packet[2] = (ns << 7);
+    packet[3] = packet[1] ^ packet[2];
+
+    int i, j = 0;
+    unsigned char bcc2 = 0;
+    for (i = 0; i < bufSize; i++) {
+        bcc2 ^= buf[i];
+
+        if (buf[i] == FLAG || buf[i] == ESC) {
+            packet[4 + i + j] = ESC;
+            packet[4 + i + j + 1] = ESC_BCC2 & buf[i];
+            j++;
+        } else {
+            packet[4 + i + j] = buf[i];
+        }
+    }
+    if (bcc2 == FLAG || bcc2 == ESC) {
+        packet[4 + i + j] = ESC;
+        packet[4 + i + j + 1] = ESC_BCC2 & bcc2;
+        j++;
+    } else {
+        packet[4 + i + j] = bcc2;
+    }
+    
+    packet[5 + i + j] = FLAG;
+    return 6 + i + j;
+}
+

@@ -10,7 +10,14 @@ typedef enum {
     STOP
 } State;
 
-State nextState(State state, unsigned char byte, unsigned char control, unsigned char command);
-int isStateFinal(State state);
+typedef struct {
+    State state;
+    int isREJ;
+    int ignore;
+} StateMachine;
+
+StateMachine createStateMachine();
+StateMachine nextState(StateMachine sm, unsigned char byte, unsigned char control, unsigned char command);
+int isStateFinal(StateMachine sm);
 
 #endif // _STATE_H_

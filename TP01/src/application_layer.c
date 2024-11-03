@@ -6,142 +6,183 @@
 #include <stdlib.h>
 #include <string.h>
 
-FILE *inputFile;
-FILE *outputFile;
-char buffer[BUFFER_SIZE];
-int handleTransmitter();
-int handleReceiver();
+void handleTransmitter(FILE *inputFile, const char *filename, int fd);
+void handleReceiver(FILE *outputFile, int fd);
+int buildControl(unsigned char *control, int start, int file_size, const char *filename);
+int buildData(unsigned char *data, unsigned char *buffer, int size, int n);
+int getSize(FILE* file);
+int nBytes(int n);
 
 
 void applicationLayer(const char *serialPort, const char *role, int baudRate,
-                      int nTries, int timeout, const char *filename)
-{
+                      int nTries, int timeout, const char *filename) {
     LinkLayer linkLayer;
+    LinkLayerRole r = strcmp(role, "tx") == 0 ? LlTx : LlRx;
 
     strcpy(linkLayer.serialPort, serialPort);
-
-    if (strcmp(role, "tx") == 0) {
-        linkLayer.role = LlTx;
-        inputFile = fopen(filename, "rb");
-        if (inputFile == NULL) {
-            perror("ERROR: can't open input file");
-            exit(-1);
-        }
-    }
-    else if (strcmp(role, "rx") == 0) {
-        linkLayer.role = LlRx;
-        outputFile = fopen(filename, "wb");
-        if (outputFile == NULL) {
-            perror("ERROR: can't create output file");
-            exit(-1);
-        }
-    }
-    else {
-        perror("ERROR: invalid role at ApplicationLayer\n");
-        exit(-1);
-    }
-
+    linkLayer.role = r;
     linkLayer.baudRate = baudRate;
     linkLayer.nRetransmissions = nTries;
-    linkLayer.timeout = timeout;    
+    linkLayer.timeout = timeout;
 
     int fd = llopen(linkLayer);
 
     if (fd < 0) {
-        perror("ERROR: failed to open connection\n");
+        printf("ERROR: failed to open connection\n");
         exit(-1);
     }
 
-    printf("CONNECTION OPEN\n");
+    FILE *inputFile = NULL;
+    FILE *outputFile = NULL;
 
-    if (linkLayer.role == LlTx) {
-        if (handleTransmitter() < 0) return;
-    }
-    else if (linkLayer.role == LlRx) {
-        if (handleReceiver() < 0) return;
+    if (r == LlTx) {
+        inputFile = fopen(filename, "rb");
+        if (inputFile == NULL) {
+            printf("ERROR: can't open input file\n");
+            llclose(fd);
+            exit(-1);
+        }
+        handleTransmitter(inputFile, filename, fd);
+    } else if (r == LlRx) {
+        outputFile = fopen("penguin-received.gif", "wb");
+        if (outputFile == NULL) {
+            printf("ERROR: can't create output file\n");
+            llclose(fd);
+            exit(-1);
+        }
+        handleReceiver(outputFile, fd);
+    } else {
+        printf("ERROR: invalid role at applicationLayer\n");
+        exit(-1);
     }
 
     if (llclose(fd) == -1) {
-        perror("ERROR: failed to close connection\n");
+        printf("ERROR: failed to close connection\n");
         exit(-1);
     }
 
     printf("CONNECTION CLOSED\n");
+    if (inputFile) fclose(inputFile);
+    if (outputFile) fclose(outputFile);
+    exit(0);
 }
 
 
-int handleTransmitter() {
-    if (inputFile == NULL) {
-        perror("ERROR: file not found\n");
+void handleTransmitter(FILE *inputFile, const char *filename, int fd) {
+    unsigned char buffer[BUFFER_SIZE + 1], control[BUFFER_SIZE + 1];
+    int size = getSize(inputFile);
+
+    buildControl(control, 2, size, filename);
+
+    if (llwrite(control, 5 + nBytes(size) + strlen(filename)) == -1) {
+        printf("ERROR: failed to send control packet\n");
+        llclose(fd);
+        fclose(inputFile);
         exit(-1);
     }
 
-    size_t bytesRead;
-    int totalBytesSent = 0;
+    int n = 0, sz, bytes;
+    while ((sz = fread(buffer, 1, BUFFER_SIZE - 4, inputFile)) > 0) {
+        printf("Packet #%d\n", n);
+        unsigned char data[BUFFER_SIZE];
 
-    printf("Starting transmission...\n");
+        buildData(data, buffer, sz, n);
 
-    while (1) {
-        bytesRead = fread(buffer, 1, BUFFER_SIZE, inputFile);
-        if (bytesRead == 0) {
-            if (feof(inputFile)) break;
-            if (ferror(inputFile)) {
-                perror("ERROR: can't read input file");
-                break;
-            }
-        }
-
-        int totalSent = 0;
-        while (totalSent < bytesRead) {
-            int res = llwrite((unsigned char *)buffer + totalSent, bytesRead - totalSent);
-            if (res < 0) {
-                perror("ERROR: failed transmitting packet\n");
+        while (1) {
+            if ((bytes = llwrite(data, sz + 4)) == -1) {
+                printf("ERROR: failed to send packet\n");
+                llclose(fd);
                 fclose(inputFile);
-                return -1;
+                exit(-1);
             }
-            totalSent += res;
+
+            if (bytes > 0)
+                break;
         }
 
-        totalBytesSent += totalSent;
-        printf("Sent %d bytes, Total sent: %d bytes\n", totalSent, totalBytesSent);
+        n++;
     }
 
-    fclose(inputFile);
-    printf("Transmission complete. Total bytes sent: %d\n", totalBytesSent);
-    return 1;
+    buildControl(control, 3, size, filename);
+
+    if (llwrite(control, 5 + nBytes(sz) + strlen(filename)) == -1) {
+        printf("ERROR: failed to send control packet\n");
+        llclose(fd);
+        fclose(inputFile);
+        exit(-1);
+    }
 }
 
 
-int handleReceiver() {
-    if (outputFile == NULL) {
-        perror("ERROR: can't create output file");
+void handleReceiver(FILE *outputFile, int fd) {
+    unsigned char control[BUFFER_SIZE], data[BUFFER_SIZE];
+
+    if (llread(control) == -1) {
+        printf("ERROR: failed to receive control packet\n");
+        llclose(fd);
+        fclose(outputFile);
         exit(-1);
     }
 
-    int bytesReceived;
-    int totalBytesReceived = 0;
-
-    printf("Receiving data...\n");
-
-    while ((bytesReceived = llread((unsigned char *)buffer)) > 0) {
-        int bytesToWrite = bytesReceived;
-        int bytesWritten = fwrite(buffer, 1, bytesToWrite, outputFile);
-        if (bytesWritten != bytesToWrite) {
-            perror("ERROR: can't write to file");
-            break;
+    int bytes;
+    while (1) {
+        if ((bytes = llread(data)) == -1) {
+            printf("ERROR: failed to receive data packet\n");
+            llclose(fd);
+            fclose(outputFile);
+            exit(-1);
         }
+        if (data[0] == 3)
+            break;
 
-        totalBytesReceived += bytesWritten;
-        printf("Received %d bytes, Total received: %d bytes\n", bytesWritten, totalBytesReceived);
+        if (bytes > 0)
+            fwrite(data + 4, 1, bytes - 4, outputFile);
+    }
+}
+
+
+int getSize(FILE* file) {
+    fseek(file, 0, SEEK_END);
+    int size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    return size;
+}
+
+
+int buildControl(unsigned char *control, int start, int file_size, const char *filename) {
+    control[0] = start;
+    control[1] = 0;
+    int l1 = nBytes(file_size); 
+    control[2] = l1;
+
+    for (int i = 0; i < l1; i++) {
+        control[3 + i] = (file_size >> (8 * (l1 - 1 - i))) & 0xFF;
     }
 
-    if (bytesReceived < 0) {
-        perror("ERROR: failed receiving packet");
-        exit(-1);
-    } else {
-        printf("File received successfully. Total bytes received: %d\n", totalBytesReceived);
-    }
+    control[3 + l1] = 1;
+    control[4 + l1] = strlen(filename);
+    strncpy((char *)(control + 5 + l1), filename, strlen(filename));
 
-    fclose(outputFile);
+    return 5 + l1 + strlen(filename);
+}
+
+
+int nBytes(int n) {
+    int bytes = 0;
+    while (n > 0) {
+        n /= 256;
+        bytes++;
+    }
+    return bytes;
+}
+
+
+int buildData(unsigned char *data, unsigned char *buffer, int size, int n) {
+    data[0] = 1;
+    data[1] = n;
+    data[2] = size / 256;
+    data[3] = size % 256;
+    memcpy(data + 4, buffer, size);
+
     return 1;
 }
