@@ -17,13 +17,17 @@ int nBytes(int n);
 void applicationLayer(const char *serialPort, const char *role, int baudRate,
                       int nTries, int timeout, const char *filename) {
     LinkLayer linkLayer;
-    LinkLayerRole r = strcmp(role, "tx") == 0 ? LlTx : LlRx;
 
     strcpy(linkLayer.serialPort, serialPort);
-    linkLayer.role = r;
     linkLayer.baudRate = baudRate;
     linkLayer.nRetransmissions = nTries;
     linkLayer.timeout = timeout;
+
+    if (strcmp(role, "tx") == 0) {
+        linkLayer.role = LlTx;
+    } else {
+        linkLayer.role = LlRx;
+    }
 
     int fd = llopen(linkLayer);
 
@@ -32,10 +36,12 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         exit(-1);
     }
 
+    printf("CONNECTION OPEN\n");
+
     FILE *inputFile = NULL;
     FILE *outputFile = NULL;
 
-    if (r == LlTx) {
+    if (linkLayer.role == LlTx) {
         inputFile = fopen(filename, "rb");
         if (inputFile == NULL) {
             printf("ERROR: can't open input file\n");
@@ -43,7 +49,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
             exit(-1);
         }
         handleTransmitter(inputFile, filename, fd);
-    } else if (r == LlRx) {
+    } else if (linkLayer.role == LlRx) {
         outputFile = fopen("penguin-received.gif", "wb");
         if (outputFile == NULL) {
             printf("ERROR: can't create output file\n");
@@ -96,8 +102,7 @@ void handleTransmitter(FILE *inputFile, const char *filename, int fd) {
                 exit(-1);
             }
 
-            if (bytes > 0)
-                break;
+            if (bytes > 0) break;
         }
 
         n++;
@@ -132,8 +137,7 @@ void handleReceiver(FILE *outputFile, int fd) {
             fclose(outputFile);
             exit(-1);
         }
-        if (data[0] == 3)
-            break;
+        if (data[0] == 3) break;
 
         if (bytes > 0)
             fwrite(data + 4, 1, bytes - 4, outputFile);
@@ -150,20 +154,25 @@ int getSize(FILE* file) {
 
 
 int buildControl(unsigned char *control, int start, int file_size, const char *filename) {
-    control[0] = start;
-    control[1] = 0;
-    int l1 = nBytes(file_size); 
-    control[2] = l1;
+    int index = 0;
+    
+    control[index++] = start;
+    control[index++] = 0;
+    
+    int file_size_len = nBytes(file_size);
+    control[index++] = file_size_len;
 
-    for (int i = 0; i < l1; i++) {
-        control[3 + i] = (file_size >> (8 * (l1 - 1 - i))) & 0xFF;
+    for (int i = file_size_len - 1; i >= 0; i--) {
+        control[index++] = (file_size >> (8 * i)) & 0xFF;
     }
 
-    control[3 + l1] = 1;
-    control[4 + l1] = strlen(filename);
-    strncpy((char *)(control + 5 + l1), filename, strlen(filename));
-
-    return 5 + l1 + strlen(filename);
+    control[index++] = 1;
+    int filename_len = strlen(filename);
+    control[index++] = filename_len;
+    
+    strncpy((char *)(control + index), filename, filename_len);
+    
+    return index + filename_len;
 }
 
 
@@ -178,11 +187,14 @@ int nBytes(int n) {
 
 
 int buildData(unsigned char *data, unsigned char *buffer, int size, int n) {
-    data[0] = 1;
-    data[1] = n;
-    data[2] = size / 256;
-    data[3] = size % 256;
-    memcpy(data + 4, buffer, size);
+    int index = 0;
+
+    data[index++] = 1;
+    data[index++] = n;
+    data[index++] = (size >> 8) & 0xFF;
+    data[index++] = size & 0xFF;
+
+    memcpy(data + index, buffer, size);
 
     return 1;
 }

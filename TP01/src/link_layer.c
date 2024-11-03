@@ -149,8 +149,7 @@ int llread(unsigned char *packet) {
     unsigned char buf[6];
     StateMachine state = createStateMachine();
 
-    while (state.state != BCC_OK)
-    {
+    while (state.state != BCC_OK) {
         if (readByteSerialPort(buf) == 0) continue;
 
         if (state.state == A_RCV && (*buf == (0 << 7) || (*buf == (1 << 7)))) {
@@ -165,16 +164,10 @@ int llread(unsigned char *packet) {
     unsigned char bcc2 = 0;
     int i = 0, data = 0;
 
-    while (!isStateFinal(state))
-    {
-        if (state.ignore == TRUE || state.isREJ == TRUE)
-            break;
-
-        if (readByteSerialPort(buf) == 0)
-            continue;
-
-        if (i == 0)
-            data = (*buf == 1);
+    while (!isStateFinal(state)) {
+        if (state.ignore == TRUE || state.isREJ == TRUE) break;
+        if (readByteSerialPort(buf) == 0) continue;
+        if (i == 0) data = (*buf == 1);
 
         if (i == 1 && data) {
             printf("Packet #%d \n", *buf);
@@ -447,33 +440,33 @@ void printStatistics() {
 
 
 int buildPacket(const unsigned char *buf, int bufSize, unsigned char *packet, int ns) {
-    packet[0] = FLAG;
-    packet[1] = A_TX;
-    packet[2] = (ns << 7);
-    packet[3] = packet[1] ^ packet[2];
+    int index = 0;
+    packet[index++] = FLAG;
+    packet[index++] = A_TX;
+    packet[index++] = (ns << 7);
+    packet[index++] = packet[1] ^ packet[2];
 
-    int i, j = 0;
     unsigned char bcc2 = 0;
-    for (i = 0; i < bufSize; i++) {
+    for (int i = 0; i < bufSize; i++) {
         bcc2 ^= buf[i];
 
         if (buf[i] == FLAG || buf[i] == ESC) {
-            packet[4 + i + j] = ESC;
-            packet[4 + i + j + 1] = ESC_BCC2 & buf[i];
-            j++;
+            packet[index++] = ESC;
+            packet[index++] = ESC_BCC2 & buf[i];
         } else {
-            packet[4 + i + j] = buf[i];
+            packet[index++] = buf[i];
         }
     }
+
     if (bcc2 == FLAG || bcc2 == ESC) {
-        packet[4 + i + j] = ESC;
-        packet[4 + i + j + 1] = ESC_BCC2 & bcc2;
-        j++;
+        packet[index++] = ESC;
+        packet[index++] = ESC_BCC2 & bcc2;
     } else {
-        packet[4 + i + j] = bcc2;
+        packet[index++] = bcc2;
     }
-    
-    packet[5 + i + j] = FLAG;
-    return 6 + i + j;
+
+    packet[index++] = FLAG;
+
+    return index;
 }
 
