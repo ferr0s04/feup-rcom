@@ -89,21 +89,19 @@ int llwrite(const unsigned char *buf, int bufSize) {
     alarmEnabled = FALSE;
     StateMachine state = createStateMachine();
 
-    while (alarmCount < linkLayer.nRetransmissions && !isStateFinal(state)) {
-        if (alarmEnabled == FALSE || state.isREJ == TRUE) {
-            if (state.isREJ == TRUE) {
+    while (alarmCount < linkLayer.nRetransmissions) {
+        if (!alarmEnabled || state.isREJ) {
+            if (state.isREJ) {
                 statistics.retransmissions++;
-                alarmCount++;
                 state.state = START;
                 state.isREJ = FALSE;
-                alarmEnabled = FALSE;
-                continue;
+                alarmCount = 0;
             }
-
+            
             (void)signal(SIGALRM, alarmHandler);
             int packetSize = buildPacket(buf, bufSize, _buf, ns);
             bytes = writeBytesSerialPort(_buf, packetSize);
-
+            
             if (bytes < 0) exit(-1);
             statistics.framesSent++;
 
@@ -122,23 +120,20 @@ int llwrite(const unsigned char *buf, int bufSize) {
             printf("RR received\n");
             statistics.receivedRR++;
             statistics.framesReceived++;
-            break;
-        } else if (state.isREJ == TRUE) {
+            nr = ns;
+            ns = (ns + 1) % 2;
+            alarmCount = 0;
+            alarmEnabled = FALSE;
+            return bytes;
+        } else if (state.isREJ) {
             printf("REJ received\n");
             statistics.receivedREJ++;
-            readByteSerialPort(_buf);
-            readByteSerialPort(_buf);
+            alarmEnabled = FALSE;
         }
     }
 
-    if (isStateFinal(state)) {
-        nr = ns;
-        ns = (ns + 1) % 2;
-        return bytes;
-    } else {
-        printf("ERROR: llwrite\n");
-        return -1;
-    }
+    printf("ERROR: llwrite\n");
+    return -1;
 }
 
 
