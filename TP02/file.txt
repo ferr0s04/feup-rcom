@@ -1,0 +1,26 @@
+Kernel IP routing table
+Destination     Gateway         Genmask         Flags Metric Ref    Use Iface
+0.0.0.0         172.16.60.254   0.0.0.0         UG    0      0        0 eth1
+0.0.0.0         10.227.20.254   0.0.0.0         UG    0      0        0 eth0
+10.227.20.0     0.0.0.0         255.255.255.0   U     0      0        0 eth0
+172.16.60.0     0.0.0.0         255.255.255.0   U     0      0        0 eth1
+172.16.61.0     172.16.60.254   255.255.255.0   UG    0      0        0 eth1
+
+root@gnu63:~# route del -net 0.0.0.0
+root@gnu63:~# route add -net 0.0.0.0 gw 10.227.20.254 dev eth0
+root@gnu63:~# route -n
+Kernel IP routing table
+Destination     Gateway         Genmask         Flags Metric Ref    Use Iface
+0.0.0.0         10.227.20.254   0.0.0.0         UG    0      0        0 eth0
+10.227.20.0     0.0.0.0         255.255.255.0   U     0      0        0 eth0
+172.16.60.0     0.0.0.0         255.255.255.0   U     0      0        0 eth1
+172.16.61.0     172.16.60.254   255.255.255.0   UG    0      0        0 eth1
+root@gnu63:~# arp
+Address                  HWtype  HWaddress           Flags Mask            Iface
+10.227.20.114            ether   00:21:5a:5a:75:bb   C                     eth0
+172.16.60.254            ether   00:08:54:71:73:ed   C                     eth1
+10.227.20.254            ether   e4:8d:8c:20:25:c8   C                     eth0
+root@gnu63:~# arp -a
+? (10.227.20.114) at 00:21:5a:5a:75:bb [ether] on eth0
+? (172.16.60.254) at 00:08:54:71:73:ed [ether] on eth1
+? (10.227.20.254) at e4:8d:8c:20:25:c8 [ether] on eth0
