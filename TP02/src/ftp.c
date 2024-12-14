@@ -47,22 +47,33 @@ void parse_ftp_url(const char *url, char *user, char *pass, char *host, char *pa
     *port = 21;
 
     char *at = strchr(temp, '@');
+    char *host_part = temp;
+
     if (at) {
         *at = '\0';
         sscanf(temp, "%[^:]:%s", user, pass);
-        sscanf(at + 1, "%[^:/]:%m[^/]/%s", host, port, path);
-        if (*port == 0) {
-            *port = 21;
-        }
+        host_part = at + 1;
     } else {
         strcpy(user, "anonymous");
         strcpy(pass, "anonymous");
+    }
 
-        if (strchr(temp, ':')) {
-            sscanf(temp, "%[^:/]:%d/%s", host, port, path);
-        } else {
-            sscanf(temp, "%[^/]/%s", host, path);
-        }
+    char *slash = strchr(host_part, '/');
+    char *colon = strchr(host_part, ':');
+
+    if (slash) {
+        *slash = '\0';
+        strcpy(path, slash + 1);
+    } else {
+        strcpy(path, "");
+    }
+
+    if (colon && colon < slash) {
+        *colon = '\0';
+        strcpy(host, host_part);
+        *port = atoi(colon + 1);
+    } else {
+        strcpy(host, host_part);
     }
 }
 
@@ -193,6 +204,12 @@ int main(int argc, char *argv[]) {
     int port;
     char response[BUFFER_SIZE] = {0};
     parse_ftp_url(argv[1], user, pass, host, path, &port);
+
+    printf("User: %s\n", user);
+    printf("Pass: %s\n", pass);
+    printf("Host: %s\n", host);
+    printf("Port: %d\n", port);
+    printf("Path: %s\n", path);
 
     printf("Connecting to %s...\n", host);
 
