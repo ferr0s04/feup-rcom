@@ -205,12 +205,6 @@ int main(int argc, char *argv[]) {
     char response[BUFFER_SIZE] = {0};
     parse_ftp_url(argv[1], user, pass, host, path, &port);
 
-    printf("User: %s\n", user);
-    printf("Pass: %s\n", pass);
-    printf("Host: %s\n", host);
-    printf("Port: %d\n", port);
-    printf("Path: %s\n", path);
-
     printf("Connecting to %s...\n", host);
 
     // Establish connection
