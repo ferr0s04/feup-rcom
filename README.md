@@ -5,5 +5,5 @@ Computer Networks (RCOM)
 
 **Contents**  
 Solved weekly homework exercises  
-Project 1 (Data Link Protocol)  
-Project 2 - SOON
+Project 1 - Data Link Protocol  
+Project 2 - FTP Client & Configuration of a Computer Network
